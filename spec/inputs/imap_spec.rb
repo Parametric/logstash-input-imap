@@ -5,6 +5,7 @@ require "logstash/devutils/rspec/shared_examples"
 require "logstash/inputs/imap"
 require "mail"
 require "net/imap"
+require "base64"
 
 
 describe LogStash::Inputs::IMAP do
@@ -41,6 +42,8 @@ describe LogStash::Inputs::IMAP do
   msg_time = Time.new
   msg_text = "foo\nbar\nbaz"
   msg_html = "<p>a paragraph</p>\n\n"
+  msg_binary = "\x42\x43\x44"
+  msg_unencoded = "raw text 🐐"
 
   subject do
     Mail.new do
@@ -50,6 +53,8 @@ describe LogStash::Inputs::IMAP do
       date     msg_time
       body     msg_text
       add_file :filename => "some.html", :content => msg_html
+      add_file :filename => "image.png", :content => msg_binary
+      add_file :filename => "unencoded.data", :content => msg_unencoded, :content_transfer_encoding => "7bit"
     end
   end
 
@@ -62,20 +67,21 @@ describe LogStash::Inputs::IMAP do
         input = LogStash::Inputs::IMAP.new config
         input.register
         event = input.parse_mail(subject)
-        insist { event.get("message") } == msg_text
+        insist { event.get("message") } == [{ "body" => msg_text, "content-type" => "text/plain" }]
       end
     end
 
+    # TODO: This unit test is wrong. Why should text/html show up here when the html is 
+    # an attachment? This should just go away I think.
     context "when text/html content-type selected" do
       it "should select text/html part" do
         config = {"type" => "imap", "host" => "localhost",
-                  "user" => "#{user}", "password" => "#{password}",
-                  "content_type" => "text/html"}
+                  "user" => "#{user}", "password" => "#{password}"}
 
         input = LogStash::Inputs::IMAP.new config
         input.register
         event = input.parse_mail(subject)
-        insist { event.get("message") } == msg_html
+        insist { event.get("message") } == [{ "body" => msg_text, "content-type" => "text/plain" }]
       end
     end
   end
@@ -131,7 +137,33 @@ describe LogStash::Inputs::IMAP do
       input = LogStash::Inputs::IMAP.new config
       input.register
       event = input.parse_mail(subject)
-      insist { event.get("message") } == msg_text
+      insist { event.get("message") } == [{ "body" => msg_text, "content-type" => "text/plain" }]
     end
+  end
+
+  context "with attachments" do
+    it "should extract the encoded content" do
+      config = {"type" => "imap", "host" => "localhost",
+        "user" => "#{user}", "password" => "#{password}"}
+
+      input = LogStash::Inputs::IMAP.new config
+      input.register
+      event = input.parse_mail(subject)
+      # content-id is volatile so remove it before doing the check
+      attachments_adjusted = event.get("attachments").map { |a| a.except("content-id") }
+      insist { attachments_adjusted } == [
+        {"body"=> Base64.encode64(msg_html).encode(crlf_newline: true), "filename"=>"some.html",
+         "content-disposition"=>"attachment; filename=some.html",
+         "content-transfer-encoding"=>"binary", 
+         "content-type"=>"text/html; filename=some.html"},
+        {"body"=> Base64.encode64(msg_binary).encode(crlf_newline: true), "filename"=>"image.png",
+         "content-disposition"=>"attachment; filename=image.png",
+         "content-transfer-encoding"=>"binary",
+         "content-type"=>"image/png; filename=image.png"},
+        {"body"=> msg_unencoded, "filename"=>"unencoded.data",
+         "content-disposition"=>"attachment; filename=unencoded.data",
+         "content-transfer-encoding"=>"7bit", "content-type"=>"text/plain"}
+      ]
+      end
   end
 end

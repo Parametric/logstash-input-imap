@@ -28,18 +28,16 @@ class LogStash::Inputs::IMAP < LogStash::Inputs::Base
   config :check_interval, :validate => :number, :default => 300
   config :delete, :validate => :boolean, :default => false
   config :expunge, :validate => :boolean, :default => false
-  config :strip_attachments, :validate => :boolean, :default => false
   config :mark_read, :validate => :boolean, :default => true
-
-  # For multipart messages, use the first part that has this
-  # content-type as the event message.
-  config :content_type, :validate => :string, :default => "text/plain"
 
   # Whether to use IMAP uid to track last processed message
   config :uid_tracking, :validate => :boolean, :default => false
 
   # Path to file with last run time metadata
   config :sincedb_path, :validate => :string, :required => false
+
+  # Determines whether to pass along the entire body for each part
+  config :include_entire_body, :validate => :boolean, :required => false, :default => true
 
   def register
     require "net/imap" # in stdlib
@@ -73,7 +71,6 @@ class LogStash::Inputs::IMAP < LogStash::Inputs::Base
       @logger.info("Loading \"uid_last_value\": \"#{@uid_last_value}\"")
     end
 
-    @content_type_re = Regexp.new("^" + @content_type)
   end # def register
 
   def connect
@@ -118,11 +115,11 @@ class LogStash::Inputs::IMAP < LogStash::Inputs::Base
       items.each do |item|
         next unless item.attr.has_key?("BODY[]")
         mail = Mail.read_from_string(item.attr["BODY[]"])
-        if @strip_attachments
-          queue << parse_mail(mail.without_attachments!)
-        else
-          queue << parse_mail(mail)
-        end
+
+        # Removed strip_attachments option because "mail.without_attachments!" was
+        # stripping not just attachements but also files within a multipart MIME
+        queue << parse_mail(mail)
+
         # Mark message as processed
         @uid_last_value = item.attr["UID"]
         if (@uid_tracking && @mark_read) || @delete || @expunge
@@ -156,21 +153,79 @@ class LogStash::Inputs::IMAP < LogStash::Inputs::Base
     end
   end
 
+  # Summarize the bodies in the given list of parts
+  # The purpose is to be able to debug this plugin's output without haven't to sift through
+  # too much text.
+  def summarize_bodies(parts)
+    return parts.map do |p|
+      p["body"] = "Body summary - length #{p["body"].length}"
+      p
+    end
+  end
+
+  # Constructs an array of attachement objects given a mail object
+  def self.parse_attachments(mail)
+    return mail.attachments.map do |a|
+      {
+        "filename" => a.filename, "content-id" => a.content_id,
+        "content-type" => a.content_type,
+        "content-disposition" => a.content_disposition,
+        "content-transfer-encoding" => a.content_transfer_encoding,
+        "body" => a.body.encoded
+      }
+    end
+  end
+
+  # Constructs an array of message objects given a mail object
+  def self.parse_message(mail)
+    proc_part = Proc.new { |p|
+      if p.attachment?
+        nil
+      else
+        # From experiments, content-id and content-disposition seems always nil
+        # for the non-attachment parts so excluding here. Also excluding
+        # content-transfer-encoding because the body here is provided decoded.
+        # RFC about content-disposition https://tools.ietf.org/html/rfc1806
+        { "content-type" => p.content_type, "body" => p.body.decoded }
+      end
+    }
+
+    if mail.multipart?
+      parts = mail.parts.map { |p|
+        if p.multipart?
+          # You are here bc this email is multipart/mixed with a nested
+          # multipart/alternative or multipart/related
+          p.parts.map { |pp|
+            proc_part.call(pp)
+          }
+        else
+          proc_part.call(p)
+        end
+      }
+
+      return parts.flatten.compact
+    else
+      # No multipart message, just use the body as the event text
+      return [proc_part.call(mail)]
+    end
+  end
+
   def parse_mail(mail)
     # Add a debug message so we can track what message might cause an error later
     @logger.debug? && @logger.debug("#{@user}@#{@host}:#{@port}/#{@folder}: Working with message_id", :message_id => mail.message_id)
-    # TODO(sissel): What should a multipart message look like as an event?
-    # For now, just take the plain-text part and set it as the message.
-    if mail.parts.count == 0
-      # No multipart message, just use the body as the event text
-      message = mail.body.decoded
-    else
-      # Multipart message; use the first text/plain part we find
-      part = mail.parts.find { |p| p.content_type.match @content_type_re } || mail.parts.first
-      message = part.decoded
-    end
+    message = LogStash::Inputs::IMAP.parse_message(mail)
+    message = @include_entire_body ? message : summarize_bodies(message)
 
-    @codec.decode(message) do |event|
+    attachments = LogStash::Inputs::IMAP.parse_attachments(mail)
+    attachments = @include_entire_body ? attachments : summarize_bodies(attachments)
+
+    @codec.decode("Real message should replace this") do |event|
+      # Tried to use json codec but ran into dependency issue
+      # After experimentation, re-setting the "message" in the object seems to be
+      # the easiest approach. Note that "event" here is a Logstash::Event object
+      # which I think is defined in the logstash-core lib.
+      event.set("message", message)
+
       # Use the 'Date' field as the timestamp
       event.timestamp = LogStash::Timestamp.new(mail.date.to_time)
 
@@ -198,6 +253,11 @@ class LogStash::Inputs::IMAP < LogStash::Inputs::Base
         when nil
           event.set(name, value)
         end
+      end
+
+      # Add attachments
+      if attachments && attachments.length > 0
+        event.set('attachments', attachments)
       end
 
       decorate(event)
