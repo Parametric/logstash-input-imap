@@ -32,12 +32,21 @@ class LogStash::Inputs::IMAP < LogStash::Inputs::Base
 
   # Whether to use IMAP uid to track last processed message
   config :uid_tracking, :validate => :boolean, :default => false
+  config :uid_tracking_init_search, :validate => :string, :default => "ALL"
 
   # Path to file with last run time metadata
   config :sincedb_path, :validate => :string, :required => false
 
   # Determines whether to pass along the entire body for each part
   config :include_entire_body, :validate => :boolean, :required => false, :default => true
+
+  def get_uid_last_value
+    if File.exist?(@sincedb_path)
+      return File.read(@sincedb_path).to_i
+    else
+      return nil
+    end
+  end
 
   def register
     require "net/imap" # in stdlib
@@ -66,10 +75,9 @@ class LogStash::Inputs::IMAP < LogStash::Inputs::Base
       raise ArgumentError.new("The \"sincedb_path\" argument must point to a file, received a directory: \"#{@sincedb_path}\"")
     end
     @logger.info("Using \"sincedb_path\": \"#{@sincedb_path}\"")
-    if File.exist?(@sincedb_path)
-      @uid_last_value = File.read(@sincedb_path).to_i
-      @logger.info("Loading \"uid_last_value\": \"#{@uid_last_value}\"")
-    end
+
+    @uid_last_value = get_uid_last_value
+    @logger.info("Loading \"uid_last_value\": \"#{@uid_last_value}\"")
 
   end # def register
 
@@ -85,14 +93,20 @@ class LogStash::Inputs::IMAP < LogStash::Inputs::Base
 
   def run(queue)
     @run_thread = Thread.current
-    Stud.interval(@check_interval) do
+    Stud.interval(@check_interval, opts={:sleep_then_run => true}) do
       check_mail(queue)
     end
   end
 
   def check_mail(queue)
+    # TODO: Maybe breakup this method in a way where the imap open
+    # connection is minimized in order to support more concurrent imap
+    # processing
     # TODO(sissel): handle exceptions happening during runtime:
     # EOFError, OpenSSL::SSL::SSLError
+    
+    @logger.debug? && @logger.debug("#{@user}@#{@host}:#{@port}/#{@folder}: Checking mail")
+
     imap = connect
     imap.select(@folder)
 
@@ -104,7 +118,7 @@ class LogStash::Inputs::IMAP < LogStash::Inputs::Base
           uid <= @uid_last_value
         }
       else
-        ids = imap.uid_search("ALL")
+        ids = imap.uid_search(@uid_tracking_init_search)
       end
     else
       ids = imap.uid_search("NOT SEEN")
@@ -147,7 +161,8 @@ class LogStash::Inputs::IMAP < LogStash::Inputs::Base
 
     # Always save @uid_last_value so when tracking is switched from
     # "NOT SEEN" to "UID" we will continue from first unprocessed message
-    if @uid_last_value
+    # Write only when the value has changed - makes logs less noisy
+    if @uid_last_value and @uid_last_value != get_uid_last_value
       @logger.info("#{@user}@#{@host}:#{@port}/#{@folder}: Saving \"uid_last_value\": \"#{@uid_last_value}\"")
       File.write(@sincedb_path, @uid_last_value)
     end
@@ -212,7 +227,7 @@ class LogStash::Inputs::IMAP < LogStash::Inputs::Base
 
   def parse_mail(mail)
     # Add a debug message so we can track what message might cause an error later
-    @logger.debug? && @logger.debug("#{@user}@#{@host}:#{@port}/#{@folder}: Working with message_id", :message_id => mail.message_id)
+    @logger.trace? && @logger.trace("#{@user}@#{@host}:#{@port}/#{@folder}: Working with message_id", :message_id => mail.message_id)
     message = LogStash::Inputs::IMAP.parse_message(mail)
     message = @include_entire_body ? message : summarize_bodies(message)
 
@@ -259,6 +274,9 @@ class LogStash::Inputs::IMAP < LogStash::Inputs::Base
       if attachments && attachments.length > 0
         event.set('attachments', attachments)
       end
+
+      # Add folder name
+      event.set("folder", @folder)
 
       decorate(event)
       event
