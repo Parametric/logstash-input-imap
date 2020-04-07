@@ -91,10 +91,25 @@ class LogStash::Inputs::IMAP < LogStash::Inputs::Base
     return imap
   end
 
+  def log_prefix()
+    if @logger.debug?
+      return "#{@user}@#{@host}:#{@port}/#{@folder}"
+    else
+      return "#{@folder}"
+    end
+  end
+
   def run(queue)
     @run_thread = Thread.current
     Stud.interval(@check_interval, opts={:sleep_then_run => true}) do
-      check_mail(queue)
+      @logger.debug? && @logger.debug("#{log_prefix} - Checking mail")
+
+      start = Time.now
+      num_processed = check_mail(queue)
+
+      if num_processed > 0 or @logger.debug?
+        @logger.info("#{log_prefix} - num_processed: #{num_processed}, process_time: #{Time.now-start}s")
+      end
     end
   end
 
@@ -104,67 +119,72 @@ class LogStash::Inputs::IMAP < LogStash::Inputs::Base
     # processing
     # TODO(sissel): handle exceptions happening during runtime:
     # EOFError, OpenSSL::SSL::SSLError
-    
-    @logger.debug? && @logger.debug("#{@user}@#{@host}:#{@port}/#{@folder}: Checking mail")
+    num_processed = 0
 
-    imap = connect
-    imap.select(@folder)
+    begin
+      imap = connect
+      imap.select(@folder)
 
-    if @uid_tracking
-      if @uid_last_value
-        # If there are no new messages, uid_search returns @uid_last_value
-        # because it is the last message, so we need to delete it.
-        ids = imap.uid_search(["UID", (@uid_last_value+1..-1)]).delete_if { |uid|
-          uid <= @uid_last_value
-        }
-      else
-        ids = imap.uid_search(@uid_tracking_init_search)
-      end
-    else
-      ids = imap.uid_search("NOT SEEN")
-    end
-
-    ids.each_slice(@fetch_count) do |id_set|
-      items = imap.uid_fetch(id_set, ["BODY.PEEK[]", "UID"])
-      items.each do |item|
-        next unless item.attr.has_key?("BODY[]")
-        mail = Mail.read_from_string(item.attr["BODY[]"])
-
-        # Removed strip_attachments option because "mail.without_attachments!" was
-        # stripping not just attachements but also files within a multipart MIME
-        queue << parse_mail(mail)
-
-        # Mark message as processed
-        @uid_last_value = item.attr["UID"]
-        if (@uid_tracking && @mark_read) || @delete || @expunge
-          imap.uid_store(@uid_last_value, '+FLAGS', @delete || @expunge ? :Deleted : :Seen)
+      if @uid_tracking
+        if @uid_last_value
+          # If there are no new messages, uid_search returns @uid_last_value
+          # because it is the last message, so we need to delete it.
+          ids = imap.uid_search(["UID", (@uid_last_value+1..-1)]).delete_if { |uid|
+            uid <= @uid_last_value
+          }
+        else
+          ids = imap.uid_search(@uid_tracking_init_search)
         end
-        # Stop message processing if it is requested
+      else
+        ids = imap.uid_search("NOT SEEN")
+      end
+
+      ids.each_slice(@fetch_count) do |id_set|
+        items = imap.uid_fetch(id_set, ["BODY.PEEK[]", "UID"])
+        items.each do |item|
+          next unless item.attr.has_key?("BODY[]")
+          mail = Mail.read_from_string(item.attr["BODY[]"])
+
+          # Removed strip_attachments option because "mail.without_attachments!" was
+          # stripping not just attachements but also files within a multipart MIME
+          queue << parse_mail(mail)
+
+          # Mark message as processed
+          @uid_last_value = item.attr["UID"]
+          num_processed = num_processed+1
+
+          if (@uid_tracking && @mark_read) || @delete || @expunge
+            imap.uid_store(@uid_last_value, '+FLAGS', @delete || @expunge ? :Deleted : :Seen)
+          end
+          # Stop message processing if it is requested
+          break if stop?
+        end
+
+        # Expunge deleted messages
+        imap.expunge() if @expunge
+
+        # Stop message fetching if it is requested
         break if stop?
       end
 
-      # Expunge deleted messages
-      imap.expunge() if @expunge
+    rescue => e
+      @logger.error("#{log_prefix} - Encountered error #{e.class}", :message => e.message, :backtrace => e.backtrace)
+      # Do not raise error, check_mail will be invoked in the next run time
 
-      # Stop message fetching if it is requested
-      break if stop?
-    end
+    ensure
+      # Close the connection (and ignore errors)
+      imap.close rescue nil
+      imap.disconnect rescue nil
 
-  rescue => e
-    @logger.error("#{@user}@#{@host}:#{@port}/#{@folder}: Encountered error #{e.class}", :message => e.message, :backtrace => e.backtrace)
-    # Do not raise error, check_mail will be invoked in the next run time
+      # Always save @uid_last_value so when tracking is switched from
+      # "NOT SEEN" to "UID" we will continue from first unprocessed message
+      # Write only when the value has changed - makes logs less noisy
+      if @uid_last_value and @uid_last_value != get_uid_last_value
+        @logger.info("#{log_prefix} - Saving uid_last_value: #{@uid_last_value}")
+        File.write(@sincedb_path, @uid_last_value)
+      end
 
-  ensure
-    # Close the connection (and ignore errors)
-    imap.close rescue nil
-    imap.disconnect rescue nil
-
-    # Always save @uid_last_value so when tracking is switched from
-    # "NOT SEEN" to "UID" we will continue from first unprocessed message
-    # Write only when the value has changed - makes logs less noisy
-    if @uid_last_value and @uid_last_value != get_uid_last_value
-      @logger.info("#{@user}@#{@host}:#{@port}/#{@folder}: Saving \"uid_last_value\": \"#{@uid_last_value}\"")
-      File.write(@sincedb_path, @uid_last_value)
+      return num_processed
     end
   end
 
@@ -227,7 +247,7 @@ class LogStash::Inputs::IMAP < LogStash::Inputs::Base
 
   def parse_mail(mail)
     # Add a debug message so we can track what message might cause an error later
-    @logger.trace? && @logger.trace("#{@user}@#{@host}:#{@port}/#{@folder}: Working with message_id", :message_id => mail.message_id)
+    @logger.trace? && @logger.trace("#{log_prefix} - Working with message_id", :message_id => mail.message_id)
     message = LogStash::Inputs::IMAP.parse_message(mail)
     message = @include_entire_body ? message : summarize_bodies(message)
 
