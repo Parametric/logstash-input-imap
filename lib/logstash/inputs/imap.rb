@@ -268,14 +268,14 @@ class LogStash::Inputs::IMAP < LogStash::Inputs::Base
       mail.header_fields.each do |header|
         # 'header.name' can sometimes be a Mail::Multibyte::Chars, get it in String form
         name = @lowercase_headers ? header.name.to_s.downcase : header.name.to_s
+        # Assume we already processed the 'date' above.
+        next if name == "Date"
+
         # Call .decoded on the header in case it's in encoded-word form.
         # Details at:
         #   https://github.com/mikel/mail/blob/master/README.md#encodings
         #   http://tools.ietf.org/html/rfc2047#section-2
         value = transcode_to_utf8(header.decoded.to_s)
-
-        # Assume we already processed the 'date' above.
-        next if name == "Date"
 
         case (field = event.get(name))
         when String
